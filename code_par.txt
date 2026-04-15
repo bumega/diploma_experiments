@@ -1,0 +1,2284 @@
+import numpy as np
+import pandas as pd
+from time import perf_counter
+from typing import Any, Dict, List
+
+from sklearn.datasets import make_classification
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+from sklearn.decomposition import PCA
+from sklearn.cross_decomposition import PLSRegression
+#from umap import UMAP
+
+from pyHSICLasso import HSICLasso
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split, Subset, Dataset, ConcatDataset
+from sklearn.model_selection import train_test_split
+from typing import Tuple, Optional, Iterable
+import random
+import shap
+import copy
+import pickle  
+from sklearn.model_selection import StratifiedShuffleSplit
+import math
+from collections import defaultdict
+from sklearn.datasets import fetch_openml
+from ucimlrepo import fetch_ucirepo
+
+def compute_feature_bounds(dataset: Dataset, pad: float = 0.25):
+    if isinstance(dataset, torch.utils.data.TensorDataset):
+        X = dataset.tensors[0].to(dtype=torch.float32)
+        fmin = X.amin(dim=0)
+        fmax = X.amax(dim=0)
+        span = fmax - fmin
+        return fmin - pad * span, fmax + pad * span
+
+    if isinstance(dataset, torch.utils.data.Subset) and isinstance(dataset.dataset, torch.utils.data.TensorDataset):
+        Xfull = dataset.dataset.tensors[0]
+        idx = torch.as_tensor(dataset.indices, device=Xfull.device, dtype=torch.long)
+        X = Xfull.index_select(0, idx).to(dtype=torch.float32)
+        fmin = X.amin(dim=0)
+        fmax = X.amax(dim=0)
+        span = fmax - fmin
+        return fmin - pad * span, fmax + pad * span
+
+    xs = [dataset[i][0] for i in range(len(dataset))]
+    if len(xs) == 0:
+        raise ValueError("compute_feature_bounds: empty dataset")
+    device = xs[0].device if torch.is_tensor(xs[0]) else torch.device("cpu")
+    xs = [x.to(device) if torch.is_tensor(x) else torch.as_tensor(x, device=device) for x in xs]
+    X = torch.stack(xs, dim=0).to(dtype=torch.float32)
+    fmin = X.min(dim=0).values
+    fmax = X.max(dim=0).values
+    span = fmax - fmin
+    return fmin - pad * span, fmax + pad * span
+
+
+class UniformNoiseDataset(Dataset):
+    def __init__(
+        self,
+        feature_min: torch.Tensor,
+        feature_max: torch.Tensor,
+        n: int,
+        label: int = 0,
+        dtype: torch.dtype | None = None
+    ):
+        assert feature_min.shape == feature_max.shape
+
+        self.dtype = dtype if dtype is not None else torch.float32
+
+        feature_min = feature_min.to(dtype=self.dtype)
+        feature_max = feature_max.to(device=feature_min.device, dtype=self.dtype)
+
+        self.feature_min = feature_min
+        self.feature_max = feature_max
+        self.n = int(n)
+        self.label = int(label)
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int):
+        u = torch.rand_like(self.feature_min, dtype=self.dtype)
+        x = self.feature_min + u * (self.feature_max - self.feature_min)
+        y = torch.tensor(self.label, dtype=torch.long, device=x.device)
+        return x, y
+
+
+class LabelMappedSubset(Dataset):
+    def __init__(self, subset: Subset, label_map: dict[int, int]):
+        self.subset = subset
+        self.label_map = label_map
+
+    def __getitem__(self, idx):
+        x, y = self.subset[idx]
+
+        if torch.is_tensor(y):
+            y_int = int(y.detach().cpu().item())
+        else:
+            y_int = int(y)
+
+        y_mapped = self.label_map.get(y_int, y_int)
+        return x, torch.tensor(y_mapped, dtype=y.dtype, device=y.device)
+
+    def __len__(self):
+        return len(self.subset)
+
+
+class Abs(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.abs(x)
+
+class MLP(nn.Module):
+    def __init__(self, d_in: int, d_hidden: int = 10, n_hidden_layers: int = 2):
+
+        super().__init__()
+
+        layers = []
+
+        layers.append(nn.Linear(d_in, d_hidden))
+        layers.append(Abs())
+
+
+        for _ in range(n_hidden_layers - 1):
+            layers.append(nn.Linear(d_hidden, d_hidden))
+            layers.append(Abs())
+
+        layers.append(nn.Linear(d_hidden, 1))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+def train_one_model(
+    model: nn.Module,
+    dataset_pos_as_1: Dataset,
+    feature_min: torch.Tensor,
+    feature_max: torch.Tensor,
+    num_epochs: int = 20,
+    batch_size: int = 128,
+    lr: float = 3e-3,
+    weight_decay: float = 1e-2,
+    seed: int = 0,
+):
+    """
+    Обучает модель различать:
+      - реальные (label=1)
+      - шумовые (label=0)
+    с MSELoss.
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = next(model.parameters()).device
+    criterion = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if isinstance(dataset_pos_as_1, TensorDataset):
+        X_real = dataset_pos_as_1.tensors[0].to(device=device, dtype=torch.float32)
+        n = int(X_real.shape[0])
+        if n == 0:
+            raise ValueError("train_one_model: empty TensorDataset")
+
+        fmin = feature_min.to(device=device, dtype=torch.float32)
+        fmax = feature_max.to(device=device, dtype=torch.float32)
+        span = (fmax - fmin)
+        d = int(X_real.shape[1])
+
+        for _ in range(num_epochs):
+            model.train()
+            perm = torch.randperm(n, device=device)
+
+            for start in range(0, n, batch_size):
+                idx = perm[start:start + batch_size]
+                xb_real = X_real.index_select(0, idx)
+
+
+                u = torch.rand(xb_real.shape[0], d, device=device, dtype=torch.float32)
+                xb_noise = fmin.unsqueeze(0) + u * span.unsqueeze(0) 
+
+                xb = torch.cat([xb_real, xb_noise], dim=0) 
+                yb = torch.cat(
+                    [
+                        torch.ones(xb_real.shape[0], device=device, dtype=torch.float32),
+                        torch.zeros(xb_noise.shape[0], device=device, dtype=torch.float32),
+                    ],
+                    dim=0,
+                ).unsqueeze(1) 
+
+                pred = model(xb)
+                loss = criterion(pred, yb)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+        return model
+
+
+    n_real = len(dataset_pos_as_1)
+    if n_real <= 0:
+        raise ValueError("train_one_model: empty dataset_pos_as_1")
+
+    n_noise = max(1, n_real)
+
+    x0, _ = dataset_pos_as_1[0]
+    data_device = x0.device if torch.is_tensor(x0) else device
+
+    fmin = feature_min.detach().to(device=data_device, dtype=torch.float32)
+    fmax = feature_max.detach().to(device=data_device, dtype=torch.float32)
+
+    noise_ds = UniformNoiseDataset(fmin, fmax, n_noise, label=0, dtype=torch.float32)
+    train_ds = ConcatDataset([dataset_pos_as_1, noise_ds])
+    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    for _ in range(num_epochs):
+        model.train()
+        for xb, yb in loader:
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device).unsqueeze(-1).to(dtype=torch.float32)
+
+            pred = model(xb)
+            loss = criterion(pred, yb)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+    return model
+
+def model_train(
+    d_hidden: int,
+    n_hidden_layers: int,
+    train_data: Dataset,
+    num_epochs: int,
+    batch_size: int = 128,
+    seed: int = 0,
+    output: bool = False,
+    device: str | torch.device | None = None,
+    feature_min: torch.Tensor | None = None,
+    feature_max: torch.Tensor | None = None,
+):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if isinstance(train_data, TensorDataset):
+        X_all, y_all = train_data.tensors
+
+
+        data_device = X_all.device
+        dev = data_device if device is None else torch.device(device)
+
+        X_all = X_all.to(device=dev, dtype=torch.float32)
+        y_all = y_all.to(device=dev, dtype=torch.long)
+
+        d_in = int(X_all.shape[1])
+
+        if feature_min is None or feature_max is None:
+            fmin, fmax = compute_feature_bounds(TensorDataset(X_all, y_all))
+        else:
+            fmin, fmax = feature_min, feature_max
+        fmin = fmin.to(device=dev, dtype=torch.float32)
+        fmax = fmax.to(device=dev, dtype=torch.float32)
+
+        pos_mask = (y_all == 1)
+        neg_mask = (y_all == -1)
+        X_pos = X_all[pos_mask]
+        X_neg = X_all[neg_mask]
+
+        if X_pos.numel() == 0 or X_neg.numel() == 0:
+            raise ValueError("model_train: empty class after split (pos or neg)")
+
+        model_pos = MLP(d_in=d_in, d_hidden=d_hidden, n_hidden_layers=n_hidden_layers).to(dev)
+        model_neg = MLP(d_in=d_in, d_hidden=d_hidden, n_hidden_layers=n_hidden_layers).to(dev)
+
+        ds_pos = TensorDataset(X_pos, torch.ones(X_pos.size(0), device=dev, dtype=torch.long))
+        ds_neg = TensorDataset(X_neg, torch.ones(X_neg.size(0), device=dev, dtype=torch.long))
+
+        model_pos = train_one_model(
+            model_pos, ds_pos, fmin, fmax,
+            num_epochs=num_epochs, batch_size=batch_size, seed=seed
+        )
+        model_neg = train_one_model(
+            model_neg, ds_neg, fmin, fmax,
+            num_epochs=num_epochs, batch_size=batch_size, seed=seed + 1
+        )
+        return model_pos, model_neg
+
+    ys: list[int] = []
+    for i in range(len(train_data)):
+        y = train_data[i][1]
+        if torch.is_tensor(y):
+            ys.append(int(y.detach().cpu().item()))
+        else:
+            ys.append(int(y))
+    labels = torch.tensor(ys, dtype=torch.long)
+
+    pos_idx = (labels == 1).nonzero(as_tuple=True)[0].tolist()
+    neg_idx = (labels == -1).nonzero(as_tuple=True)[0].tolist()
+
+    train_pos = Subset(train_data, pos_idx)
+    train_neg = Subset(train_data, neg_idx)
+    train_neg_as_pos = LabelMappedSubset(train_neg, {-1: 1})
+
+    x0, _ = train_data[0]
+    d_in = x0.shape[-1]
+    data_device = x0.device if torch.is_tensor(x0) else torch.device("cpu")
+
+    dev = data_device if device is None else torch.device(device)
+
+    fmin, fmax = compute_feature_bounds(train_data)
+    fmin = fmin.to(dev)
+    fmax = fmax.to(dev)
+
+    model_pos = MLP(d_in=d_in, d_hidden=d_hidden, n_hidden_layers=n_hidden_layers).to(dev)
+    model_neg = MLP(d_in=d_in, d_hidden=d_hidden, n_hidden_layers=n_hidden_layers).to(dev)
+
+    model_pos = train_one_model(
+        model_pos, train_pos, fmin, fmax,
+        num_epochs=num_epochs, batch_size=batch_size, seed=seed
+    )
+    model_neg = train_one_model(
+        model_neg, train_neg_as_pos, fmin, fmax,
+        num_epochs=num_epochs, batch_size=batch_size, seed=seed + 1
+    )
+    return model_pos, model_neg
+
+H_TAU = 1e-3
+
+
+def metrics_from_sheet(X, y, model_pos, model_neg, beta_pos=0.1, beta_neg=0.1):
+    device = next(model_pos.parameters()).device
+    X = X.to(device=device, dtype=torch.float32)
+    y = y.to(device=device)
+
+    model_pos.eval()
+    model_neg.eval()
+    with torch.no_grad():
+        s1 = model_pos(X).flatten()
+        s2 = model_neg(X).flatten()
+
+    pos = (y == 1)
+    neg = (y == -1)
+    n1 = int(pos.sum().item())
+    n2 = int(neg.sum().item())
+
+    n02_1 = int((((s1 >= beta_pos) & (s2 <  beta_neg)) & pos).sum().item())
+    n12_1 = int((((s1 >= beta_pos) & (s2 >= beta_neg)) & pos).sum().item())
+
+    n02_2 = int((((s2 >= beta_neg) & (s1 <  beta_pos)) & neg).sum().item())
+    n12_2 = int((((s2 >= beta_neg) & (s1 >= beta_pos)) & neg).sum().item())
+
+    a1 = n02_1 / n1 if n1 else 0.0
+    a2 = n02_2 / n2 if n2 else 0.0
+    F12 = 2 * a1 * a2 / (a1 + a2 + H_TAU)
+
+    b1 = n12_1 / n1 if n1 else 0.0
+    b2 = n12_2 / n2 if n2 else 0.0
+    G12 = 2 * b1 * b2 / (b1 + b2 + H_TAU)
+
+    return dict(
+        n1=n1, n2=n2,
+        n02_1=n02_1, n12_1=n12_1,
+        n02_2=n02_2, n12_2=n12_2,
+        a1=a1, a2=a2, F12=F12,
+        b1=b1, b2=b2, G12=G12
+    )
+
+def pick_beta(scores_pos: torch.Tensor,
+              scores_noise: torch.Tensor,
+              scores_neg: Optional[torch.Tensor] = None,
+              n_quantiles: int = 19) -> Tuple[float, float]:
+
+    s_pos = scores_pos.detach().flatten()
+    s_no  = scores_noise.detach().flatten()
+    s_neg = scores_neg.detach().flatten() if (scores_neg is not None) else None
+
+    if s_pos.numel() == 0:
+        return 0.0, -1.0
+
+    device = s_pos.device
+
+    qs = torch.linspace(0.05, 0.95, steps=n_quantiles, device=device)
+
+    if s_neg is None:
+        merged = torch.cat([s_pos, s_no])
+    else:
+        merged = torch.cat([s_pos, s_no, s_neg])
+
+    pool = torch.quantile(merged, qs)
+
+    best_J, best_b = -1.0, float("nan")
+
+    for b_tensor in pool:
+        b = float(b_tensor.item())
+
+        tpr = (s_pos >= b).float().mean().item() if s_pos.numel() else 0.0
+
+        if s_neg is None:
+            tnr = (s_no < b).float().mean().item() if s_no.numel() else 0.0
+        else:
+            tnr_no  = (s_no  < b).float().mean().item() if s_no.numel()  else 0.0
+            tnr_neg = (s_neg < b).float().mean().item() if s_neg.numel() else 0.0
+            tnr = 0.5 * (tnr_no + tnr_neg)
+
+        J = tpr + tnr - 1.0
+        if J > best_J:
+            best_J, best_b = J, b
+
+    return best_b, best_J
+
+
+def choose_coord(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    d_hidden: int,
+    n_hidden_layers: int,
+    num_epochs: int,
+    batch_size: int = 128,
+    seed: int = 0,
+    output: bool = False,
+):
+
+    if torch.is_tensor(y) and y.device != X.device:
+        y = y.to(X.device)
+
+    n_features = X.shape[1]
+
+
+    idx_np = torch.arange(len(y)).detach().cpu().numpy()
+    y_np = y.detach().cpu().numpy()
+
+    train_idx_np, val_idx_np = train_test_split(
+        idx_np, test_size=0.2, random_state=seed, stratify=y_np
+    )
+
+
+    train_idx = torch.as_tensor(train_idx_np, dtype=torch.long, device=X.device)
+    val_idx   = torch.as_tensor(val_idx_np,   dtype=torch.long, device=X.device)
+
+
+    X_tr, y_tr   = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx],   y[val_idx]
+
+    fmin_all, fmax_all = compute_feature_bounds(TensorDataset(X_tr, y_tr))
+    fmin_all = fmin_all.to(X_tr.device)
+    fmax_all = fmax_all.to(X_tr.device)
+
+    rows = []
+    best_idx, best_key = None, -float("inf")
+
+    for i in range(n_features):
+
+        X_tr_upd  = torch.cat((X_tr[:, :i],  X_tr[:, i+1:]),  dim=1)
+        X_val_upd = torch.cat((X_val[:, :i], X_val[:, i+1:]), dim=1)
+
+        fmin_upd = torch.cat((fmin_all[:i], fmin_all[i+1:]))
+        fmax_upd = torch.cat((fmax_all[:i], fmax_all[i+1:]))
+
+        n_pos_val = int((y_val == 1).sum().item())
+        n_neg_val = int((y_val == -1).sum().item())
+        n_noise_for_pos = max(1, n_pos_val)
+        n_noise_for_neg = max(1, n_neg_val)
+
+        noise_pos_ds = UniformNoiseDataset(fmin_upd, fmax_upd, n_noise_for_pos, label=0, dtype=torch.float32)
+        noise_neg_ds = UniformNoiseDataset(fmin_upd, fmax_upd, n_noise_for_neg, label=0, dtype=torch.float32)
+
+        X_noise_pos = torch.stack([noise_pos_ds[j][0] for j in range(len(noise_pos_ds))], dim=0)
+        X_noise_neg = torch.stack([noise_neg_ds[j][0] for j in range(len(noise_neg_ds))], dim=0)
+
+        train_data_upd = TensorDataset(X_tr_upd, y_tr)
+
+        model_pos, model_neg = model_train(
+            train_data=train_data_upd,
+            d_hidden=d_hidden,
+            n_hidden_layers=n_hidden_layers,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            seed=seed,
+            output=output,
+        )
+
+        model_pos.eval()
+        model_neg.eval()
+        dev_pos = next(model_pos.parameters()).device
+        dev_neg = next(model_neg.parameters()).device
+
+        with torch.no_grad():
+            s1_pos = model_pos(X_val_upd[(y_val == 1)]).flatten()
+            s1_no  = model_pos(X_noise_pos).flatten()
+            beta_pos, _ = pick_beta(s1_pos, s1_no)
+
+            s2_neg = model_neg(X_val_upd[(y_val == -1)]).flatten()
+            s2_no  = model_neg(X_noise_neg).flatten()
+            beta_neg, _ = pick_beta(s2_neg, s2_no)
+
+        cG_grid = [0.1, 0.25, 0.5, 0.75, 1.0]
+        best_S, best_tuple, best_m = -float("inf"), None, None
+
+        for cG in cG_grid:
+            m_try = metrics_from_sheet(
+                X_val_upd, y_val, model_pos, model_neg,
+                beta_pos=beta_pos, beta_neg=beta_neg
+            )
+            S_try = m_try["F12"] - cG * m_try["G12"]
+            if S_try > best_S:
+                best_S, best_tuple, best_m = S_try, (beta_pos, beta_neg, cG), m_try
+
+        m = dict(best_m)
+        m["removed_idx"] = i
+        m["beta_pos_best"], m["beta_neg_best"], m["cG_best"] = best_tuple
+        m["S"] = best_S
+        rows.append(m)
+
+        if best_S > best_key:
+            best_key = best_S
+            best_idx = i
+
+    df = (
+        pd.DataFrame(rows)
+          .sort_values(["S", "F12", "G12"], ascending=[False, False, True])
+          .reset_index(drop=True)
+    )
+    return best_idx, df
+
+
+class ReducerBase:
+    def fit(self, X, y=None): ...
+    def transform(self, X): ...
+    def fit_transform(self, X, y=None):
+        self.fit(X, y)
+        return self.transform(X)
+
+    @staticmethod
+    def _to_numpy(X):
+        if torch.is_tensor(X):
+            return X.detach().cpu().numpy()
+        return np.asarray(X)
+
+    @staticmethod
+    def _to_numpy_y(y):
+        if y is None:
+            return None
+        if torch.is_tensor(y):
+            return y.detach().cpu().numpy()
+        return np.asarray(y)
+
+def sample_uniform(fmin: torch.Tensor, fmax: torch.Tensor, n: int) -> torch.Tensor:
+
+    fmax = fmax.to(device=fmin.device, dtype=fmin.dtype)
+
+
+    u = torch.rand(n, fmin.numel(), dtype=fmin.dtype, device=fmin.device)
+    return fmin.unsqueeze(0) + (fmax - fmin).unsqueeze(0) * u
+
+
+class BatchedMLP(nn.Module):
+    """
+    Пакет из B независимых MLP одинаковой архитектуры и одинаковой входной размерности.
+    Вход:
+        x: [B, N, d]  или [B, d]
+    Выход:
+        [B, N, 1]     или [B, 1]
+    """
+    def __init__(
+        self,
+        num_models: int,
+        d_in: int,
+        d_hidden: int = 10,
+        n_hidden_layers: int = 2,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.num_models = int(num_models)
+        self.d_in = int(d_in)
+        self.d_hidden = int(d_hidden)
+        self.n_hidden_layers = int(n_hidden_layers)
+
+        dims = [self.d_in] + [self.d_hidden] * self.n_hidden_layers + [1]
+
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+
+        for fan_in, fan_out in zip(dims[:-1], dims[1:]):
+            w = nn.Parameter(
+                torch.empty(self.num_models, fan_out, fan_in, device=device, dtype=dtype)
+            )
+            b = nn.Parameter(
+                torch.empty(self.num_models, fan_out, device=device, dtype=dtype)
+            )
+            self.weights.append(w)
+            self.biases.append(b)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for w, b in zip(self.weights, self.biases):
+            fan_in = int(w.shape[-1])
+            bound = 1.0 / math.sqrt(fan_in)
+            with torch.no_grad():
+                w.uniform_(-bound, bound)
+                b.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze_out = False
+
+        if x.ndim == 2:
+            x = x.unsqueeze(1)   # [B, 1, d]
+            squeeze_out = True
+
+        if x.ndim != 3:
+            raise ValueError(f"BatchedMLP expects 2D or 3D input, got shape={tuple(x.shape)}")
+        if x.shape[0] != self.num_models:
+            raise ValueError(
+                f"Batch size of models mismatch: got x.shape[0]={x.shape[0]}, "
+                f"but num_models={self.num_models}"
+            )
+
+        for li, (w, b) in enumerate(zip(self.weights, self.biases)):
+            # x: [B, N, in], w: [B, out, in] -> [B, N, out]
+            x = torch.einsum("bni,boi->bno", x, w) + b.unsqueeze(1)
+            if li < len(self.weights) - 1:
+                x = torch.abs(x)
+
+        if squeeze_out:
+            x = x.squeeze(1)
+        return x
+
+    def extract_model(self, idx: int) -> nn.Module:
+        """
+        Достаёт idx-ю обычную MLP из батча.
+        """
+        idx = int(idx)
+        model = MLP(
+            d_in=self.d_in,
+            d_hidden=self.d_hidden,
+            n_hidden_layers=self.n_hidden_layers
+        )
+
+        linear_layers = [m for m in model.net if isinstance(m, nn.Linear)]
+
+        for layer, w, b in zip(linear_layers, self.weights, self.biases):
+            layer.weight.data.copy_(w[idx].detach().cpu())
+            layer.bias.data.copy_(b[idx].detach().cpu())
+
+        return model
+
+
+def _gather_subspaces_2d(X: torch.Tensor, subs_idx: torch.Tensor) -> torch.Tensor:
+    """
+    X:        [N, p]
+    subs_idx: [B, d]
+    return:   [B, N, d]
+    """
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D, got shape={tuple(X.shape)}")
+    if subs_idx.ndim != 2:
+        raise ValueError(f"subs_idx must be 2D, got shape={tuple(subs_idx.shape)}")
+
+    B, d = subs_idx.shape
+    N, p = X.shape
+
+    Xb = X.unsqueeze(0).expand(B, N, p)
+    idx = subs_idx.unsqueeze(1).expand(B, N, d)
+    return torch.gather(Xb, dim=2, index=idx)
+
+
+def _sample_uniform_batch(
+    feature_min_batch: torch.Tensor,
+    feature_max_batch: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """
+    feature_min_batch, feature_max_batch: [B, d]
+    return: [B, n, d]
+    """
+    feature_min_batch = feature_min_batch.to(dtype=torch.float32)
+    feature_max_batch = feature_max_batch.to(
+        device=feature_min_batch.device,
+        dtype=torch.float32
+    )
+
+    B, d = feature_min_batch.shape
+    u = torch.rand(B, n, d, device=feature_min_batch.device, dtype=torch.float32)
+    span = (feature_max_batch - feature_min_batch).unsqueeze(1)
+    return feature_min_batch.unsqueeze(1) + u * span
+
+
+def _batched_train_one_side(
+    X_real_batch: torch.Tensor,
+    feature_min_batch: torch.Tensor,
+    feature_max_batch: torch.Tensor,
+    d_hidden: int,
+    n_hidden_layers: int,
+    num_epochs: int,
+    batch_size: int = 128,
+    lr: float = 3e-3,
+    weight_decay: float = 1e-2,
+    seed: int = 0,
+) -> BatchedMLP:
+    """
+    Одновременно обучает B моделей одной стороны:
+      - либо все positive-модели,
+      - либо все negative-модели.
+
+    X_real_batch: [B, N_real, d]
+    feature_min_batch / feature_max_batch: [B, d]
+    """
+    if X_real_batch.ndim != 3:
+        raise ValueError(f"X_real_batch must be 3D, got shape={tuple(X_real_batch.shape)}")
+
+    B, N_real, d = X_real_batch.shape
+    if N_real <= 0:
+        raise ValueError("No training objects for batched side training")
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = X_real_batch.device
+    dtype = X_real_batch.dtype
+
+    model = BatchedMLP(
+        num_models=B,
+        d_in=d,
+        d_hidden=d_hidden,
+        n_hidden_layers=n_hidden_layers,
+        device=device,
+        dtype=dtype,
+    )
+
+    criterion = nn.MSELoss()
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay
+    )
+
+    fmin = feature_min_batch.to(device=device, dtype=dtype).unsqueeze(1)   # [B, 1, d]
+    span = (
+        feature_max_batch.to(device=device, dtype=dtype)
+        - feature_min_batch.to(device=device, dtype=dtype)
+    ).unsqueeze(1)                                                          # [B, 1, d]
+
+    for _ in range(num_epochs):
+        # Независимая перестановка объектов для каждой модели
+        perm = torch.argsort(
+            torch.rand(B, N_real, device=device, dtype=dtype),
+            dim=1
+        )  # [B, N_real]
+
+        for start in range(0, N_real, batch_size):
+            idx = perm[:, start:start + batch_size]                         # [B, bs]
+            cur_bs = int(idx.shape[1])
+
+            idx_ex = idx.unsqueeze(-1).expand(-1, -1, d)                    # [B, bs, d]
+            xb_real = torch.gather(X_real_batch, dim=1, index=idx_ex)       # [B, bs, d]
+
+            u = torch.rand(B, cur_bs, d, device=device, dtype=dtype)
+            xb_noise = fmin.expand(-1, cur_bs, -1) + u * span.expand(-1, cur_bs, -1)
+
+            xb = torch.cat([xb_real, xb_noise], dim=1)                      # [B, 2*bs, d]
+            yb = torch.cat(
+                [
+                    torch.ones(B, cur_bs, 1, device=device, dtype=dtype),
+                    torch.zeros(B, cur_bs, 1, device=device, dtype=dtype),
+                ],
+                dim=1,
+            )                                                                # [B, 2*bs, 1]
+
+            pred = model(xb)  # [B, 2*bs, 1]
+
+            loss_per_model = ((pred - yb) ** 2).mean(dim=(1, 2))   # [B]
+            loss = loss_per_model.sum()
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+    return model
+
+
+def _batched_metrics_from_scores(
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    y: torch.Tensor,
+    beta_pos: torch.Tensor,
+    beta_neg: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """
+    s1, s2: [B, N]
+    y:      [N]
+    beta_*: [B]
+    """
+    device = s1.device
+    y = y.to(device=device)
+
+    pos = (y == 1)
+    neg = (y == -1)
+
+    n1 = max(1, int(pos.sum().item()))
+    n2 = max(1, int(neg.sum().item()))
+
+    m1 = (s1 >= beta_pos.unsqueeze(1))
+    m2 = (s2 >= beta_neg.unsqueeze(1))
+
+    pos_mask = pos.unsqueeze(0)
+    neg_mask = neg.unsqueeze(0)
+
+    n02_1 = ((m1 & ~m2) & pos_mask).sum(dim=1).to(dtype=torch.float32)
+    n02_2 = ((m2 & ~m1) & neg_mask).sum(dim=1).to(dtype=torch.float32)
+
+    a1 = n02_1 / n1
+    a2 = n02_2 / n2
+    F12 = 2.0 * a1 * a2 / (a1 + a2 + H_TAU)
+
+    n12_1 = ((m1 & m2) & pos_mask).sum(dim=1).to(dtype=torch.float32)
+    n12_2 = ((m2 & m1) & neg_mask).sum(dim=1).to(dtype=torch.float32)
+
+    b1 = n12_1 / n1
+    b2 = n12_2 / n2
+    G12 = 2.0 * b1 * b2 / (b1 + b2 + H_TAU)
+
+    return {
+        "F12": F12,
+        "G12": G12,
+        "a1": a1,
+        "a2": a2,
+        "b1": b1,
+        "b2": b2,
+    }
+
+
+def _batched_tune_betas_joint(
+    model_pos: BatchedMLP,
+    model_neg: BatchedMLP,
+    X_val_batch: torch.Tensor,
+    y_val: torch.Tensor,
+    fmin_batch: torch.Tensor,
+    fmax_batch: torch.Tensor,
+    n_grid: int = 19,
+    cG_grid: Iterable[float] = (0.25, 0.5, 0.75, 1.0),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Векторизованный аналог tune_betas_joint сразу для группы кандидатов.
+    Возвращает:
+        beta_pos_best: [B]
+        beta_neg_best: [B]
+        cG_best:       [B]
+        S_best:        [B]
+    """
+    device = X_val_batch.device
+    B, N_val, d = X_val_batch.shape
+
+    y_val = y_val.to(device=device, dtype=torch.int64)
+    pos = (y_val == 1)
+    neg = (y_val == -1)
+
+    n1 = max(1, int(pos.sum().item()))
+    n2 = max(1, int(neg.sum().item()))
+
+    c_values = torch.as_tensor(list(cG_grid), device=device, dtype=torch.float32)
+
+    model_pos.eval()
+    model_neg.eval()
+
+    with torch.no_grad():
+        s1_all = model_pos(X_val_batch).squeeze(-1)   # [B, N_val]
+        s2_all = model_neg(X_val_batch).squeeze(-1)   # [B, N_val]
+
+        Xno1 = _sample_uniform_batch(fmin_batch, fmax_batch, n1)
+        Xno2 = _sample_uniform_batch(fmin_batch, fmax_batch, n2)
+
+        s1_no = model_pos(Xno1).squeeze(-1)           # [B, n1]
+        s2_no = model_neg(Xno2).squeeze(-1)           # [B, n2]
+
+        q = torch.linspace(0.05, 0.95, steps=n_grid, device=device, dtype=torch.float32)
+
+        merged1 = torch.cat([s1_all[:, pos], s1_all[:, neg], s1_no], dim=1)
+        merged2 = torch.cat([s2_all[:, neg], s2_all[:, pos], s2_no], dim=1)
+
+        # torch.quantile(..., dim=1) -> [Q, B], поэтому делаем transpose
+        pool1 = torch.quantile(merged1, q, dim=1).transpose(0, 1).contiguous()  # [B, Q]
+        pool2 = torch.quantile(merged2, q, dim=1).transpose(0, 1).contiguous()  # [B, Q]
+
+        m1 = s1_all.unsqueeze(-1) >= pool1.unsqueeze(1)   # [B, N, Q]
+        m2 = s2_all.unsqueeze(-1) >= pool2.unsqueeze(1)   # [B, N, Q]
+
+        pos_mask = pos.view(1, N_val, 1, 1)
+        neg_mask = neg.view(1, N_val, 1, 1)
+
+        m1e = m1.unsqueeze(-1)                            # [B, N, Q, 1]
+        m2e = m2.unsqueeze(-2)                            # [B, N, 1, Q]
+
+        n02_1 = ((m1e & ~m2e) & pos_mask).sum(dim=1).to(dtype=torch.float32)  # [B, Q, Q]
+        n02_2 = ((m2e & ~m1e) & neg_mask).sum(dim=1).to(dtype=torch.float32)  # [B, Q, Q]
+
+        a1 = n02_1 / n1
+        a2 = n02_2 / n2
+        F12 = 2.0 * a1 * a2 / (a1 + a2 + H_TAU)                               # [B, Q, Q]
+
+        n12_1 = ((m1e & m2e) & pos_mask).sum(dim=1).to(dtype=torch.float32)
+        n12_2 = ((m2e & m1e) & neg_mask).sum(dim=1).to(dtype=torch.float32)
+
+        b1 = n12_1 / n1
+        b2 = n12_2 / n2
+        G12 = 2.0 * b1 * b2 / (b1 + b2 + H_TAU)                               # [B, Q, Q]
+
+        S = F12.unsqueeze(-1) - G12.unsqueeze(-1) * c_values.view(1, 1, 1, -1)  # [B, Q, Q, C]
+        S_flat = S.reshape(B, -1)
+
+        best_flat_idx = S_flat.argmax(dim=1)                                   # [B]
+
+        Q = int(pool1.shape[1])
+        C = int(c_values.numel())
+
+        q1_idx = best_flat_idx // (Q * C)
+        rem = best_flat_idx % (Q * C)
+        q2_idx = rem // C
+        c_idx = rem % C
+
+        rows = torch.arange(B, device=device)
+
+        beta_pos_best = pool1[rows, q1_idx]
+        beta_neg_best = pool2[rows, q2_idx]
+        cG_best = c_values[c_idx]
+        S_best = S_flat[rows, best_flat_idx]
+
+    return beta_pos_best, beta_neg_best, cG_best, S_best
+
+class PackedShapBatchMLP(nn.Module):
+    """
+    Объединяет B независимых MLP одинаковой архитектуры и одинаковой входной
+    размерности d в одну multi-output модель:
+
+        input:  [N, B*d]
+        output: [N, B]
+
+    b-й выход зависит только от b-го блока признаков длины d.
+    """
+
+    def __init__(
+        self,
+        weights: list[torch.Tensor],
+        biases: list[torch.Tensor],
+        d_in: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.d_in = int(d_in)
+        self.num_models = int(weights[0].shape[0])
+
+        self.weights = nn.ParameterList(
+            [nn.Parameter(w.to(device=device, dtype=dtype), requires_grad=False) for w in weights]
+        )
+        self.biases = nn.ParameterList(
+            [nn.Parameter(b.to(device=device, dtype=dtype), requires_grad=False) for b in biases]
+        )
+
+    @classmethod
+    def from_models(
+        cls,
+        models: list[nn.Module],
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> "PackedShapBatchMLP":
+        if len(models) == 0:
+            raise ValueError("from_models: empty models list")
+
+        linear_layers_all = []
+        for m in models:
+            linear_layers = [layer for layer in m.net if isinstance(layer, nn.Linear)]
+            if len(linear_layers) == 0:
+                raise ValueError("from_models: model has no Linear layers")
+            linear_layers_all.append(linear_layers)
+
+        n_layers = len(linear_layers_all[0])
+        if any(len(ll) != n_layers for ll in linear_layers_all):
+            raise ValueError("from_models: inconsistent number of Linear layers")
+
+        d_in = int(linear_layers_all[0][0].in_features)
+
+        weights: list[torch.Tensor] = []
+        biases: list[torch.Tensor] = []
+
+        for li in range(n_layers):
+            w_stack = torch.stack(
+                [linear_layers_all[b][li].weight.detach() for b in range(len(models))],
+                dim=0
+            )  # [B, out, in]
+            b_stack = torch.stack(
+                [linear_layers_all[b][li].bias.detach() for b in range(len(models))],
+                dim=0
+            )  # [B, out]
+            weights.append(w_stack)
+            biases.append(b_stack)
+
+        return cls(weights=weights, biases=biases, d_in=d_in, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [N, B*d]
+        return: [N, B]
+        """
+        if x.ndim != 2:
+            raise ValueError(f"PackedShapBatchMLP expects [N, B*d], got shape={tuple(x.shape)}")
+
+        N, Dtot = x.shape
+        if Dtot != self.num_models * self.d_in:
+            raise ValueError(
+                f"PackedShapBatchMLP: expected input dim {self.num_models * self.d_in}, got {Dtot}"
+            )
+
+        x = x.view(N, self.num_models, self.d_in).transpose(0, 1).contiguous()  # [B, N, d]
+
+        for li, (w, b) in enumerate(zip(self.weights, self.biases)):
+            x = torch.einsum("bni,boi->bno", x, w) + b.unsqueeze(1)
+            if li < len(self.weights) - 1:
+                x = torch.abs(x)
+
+        x = x.squeeze(-1).transpose(0, 1).contiguous()  # [N, B]
+        return x
+
+
+def _pack_inputs_for_shap(X_source: torch.Tensor, subs_list: list[np.ndarray]) -> torch.Tensor:
+    """
+    X_source: [N, p]
+    subs_list: list of arrays, each shape [d]
+    return: [N, B*d]
+    """
+    blocks = []
+    for subs in subs_list:
+        subs_t = torch.as_tensor(subs, dtype=torch.long, device=X_source.device)
+        blocks.append(X_source[:, subs_t])
+    return torch.cat(blocks, dim=1)
+
+
+def _normalize_shap_multioutput(vals, n_outputs: int, n_samples: int, total_features: int) -> np.ndarray:
+    """
+    Приводит shap output к ndarray shape [B, N, F].
+    Поддерживает основные форматы, которые SHAP может вернуть для multi-output.
+    """
+    if isinstance(vals, list):
+        arr = np.stack([np.asarray(v, dtype=float) for v in vals], axis=0)  # [B, N, F]
+        return arr
+
+    arr = np.asarray(vals, dtype=float)
+
+    if arr.ndim == 2:
+        # [N, F] — допустимо только для single-output
+        if n_outputs != 1:
+            raise ValueError(f"Expected multi-output SHAP, got 2D array with n_outputs={n_outputs}")
+        return arr[None, :, :]
+
+    if arr.ndim != 3:
+        raise ValueError(f"Unsupported SHAP output shape: {arr.shape}")
+
+    # Возможные варианты:
+    # [B, N, F]
+    if arr.shape[0] == n_outputs and arr.shape[1] == n_samples and arr.shape[2] == total_features:
+        return arr
+
+    # [N, F, B]
+    if arr.shape[0] == n_samples and arr.shape[1] == total_features and arr.shape[2] == n_outputs:
+        return np.transpose(arr, (2, 0, 1))
+
+    # [N, B, F]
+    if arr.shape[0] == n_samples and arr.shape[1] == n_outputs and arr.shape[2] == total_features:
+        return np.transpose(arr, (1, 0, 2))
+
+    raise ValueError(f"Cannot normalize SHAP output shape {arr.shape}")
+
+
+def _diag_block_positive_means(vals_norm: np.ndarray, block_dim: int) -> np.ndarray:
+    """
+    vals_norm: [B, N, B*d_total_per_modelblock]
+    Берёт для b-го выхода только его собственный блок признаков [b*d : (b+1)*d]
+    и считает mean(max(shap, 0)) по объектам.
+
+    return: [B, d]
+    """
+    B, N, F = vals_norm.shape
+    if F != B * block_dim:
+        raise ValueError(f"Expected total_features = B*block_dim = {B*block_dim}, got {F}")
+
+    out = np.zeros((B, block_dim), dtype=float)
+    for b in range(B):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        block_vals = vals_norm[b, :, sl]         # [N, d]
+        out[b] = np.maximum(block_vals, 0.0).mean(axis=0)
+    return out
+
+
+def _batched_gradient_shap_for_group(
+    models: list[nn.Module],
+    X_bg_pack: torch.Tensor,
+    X_eval_pack: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    """
+    Возвращает positive mean SHAP для каждого выхода/модели в группе.
+
+    models: list of B ordinary MLP
+    X_bg_pack:   [N_bg, B*d]
+    X_eval_pack: [N_ev, B*d]
+
+    return: [B, d]
+    """
+    if len(models) == 0:
+        raise ValueError("_batched_gradient_shap_for_group: empty models")
+
+    B = len(models)
+    d = int(X_bg_pack.shape[1] // B)
+
+    wrapper = PackedShapBatchMLP.from_models(models, device=device, dtype=X_bg_pack.dtype).eval()
+
+    expl = shap.GradientExplainer(wrapper, X_bg_pack)
+    vals = expl.shap_values(X_eval_pack)
+
+    vals_norm = _normalize_shap_multioutput(
+        vals=vals,
+        n_outputs=B,
+        n_samples=int(X_eval_pack.shape[0]),
+        total_features=int(X_eval_pack.shape[1]),
+    )  # [B, N, B*d]
+
+    return _diag_block_positive_means(vals_norm, block_dim=d)  # [B, d]
+
+H_TAU = 1e-3
+
+
+def tune_betas_joint(
+    model_pos: torch.nn.Module,
+    model_neg: torch.nn.Module,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+    fmin: torch.Tensor,
+    fmax: torch.Tensor,
+    n_grid: int = 19,
+    cG_grid: Iterable[float] = (0.25, 0.5, 0.75, 1.0),
+) -> Tuple[float, float, float, float]:
+    """
+    Совместно подбирает (beta_pos, beta_neg) и cG, максимизируя
+    S = F12 - cG * G12 на валидации.
+    Возвращает: (beta_pos, beta_neg, best_cG, best_S).
+    """
+
+    device = next(model_pos.parameters()).device
+    Xv = X_val.to(device=device, dtype=torch.float32)
+    yv = y_val.to(device=device, dtype=torch.int64)
+
+    model_pos.eval()
+    model_neg.eval()
+
+    with torch.no_grad():
+        s1_all = model_pos(Xv).flatten()
+        s2_all = model_neg(Xv).flatten()
+        pos = (yv == 1)
+        neg = (yv == -1)
+
+        n1 = max(1, int(pos.sum().item()))
+        n2 = max(1, int(neg.sum().item()))
+
+        Xno1 = sample_uniform(fmin.to(device), fmax.to(device), n1)
+        Xno2 = sample_uniform(fmin.to(device), fmax.to(device), n2)
+        s1_no = model_pos(Xno1).flatten()
+        s2_no = model_neg(Xno2).flatten()
+
+        q = torch.linspace(0.05, 0.95, steps=n_grid, device=device)
+        pool1 = torch.quantile(torch.cat([s1_all[pos], s1_all[neg], s1_no]), q)
+        pool2 = torch.quantile(torch.cat([s2_all[neg], s2_all[pos], s2_no]), q)
+
+        n1 = max(1, int(pos.sum().item()))
+        n2 = max(1, int(neg.sum().item()))
+
+    best_S = -float("inf")
+    best_bp = 0.0
+    best_bn = 0.0
+    best_cG = 1.0
+
+    for bpos_t in pool1:
+        bpos = float(bpos_t.item())
+        m1 = (s1_all >= bpos)
+
+        for bneg_t in pool2:
+            bneg = float(bneg_t.item())
+            m2 = (s2_all >= bneg)
+
+            n02_1 = int(((m1 & ~m2) & pos).sum().item())
+            n02_2 = int(((m2 & ~m1) & neg).sum().item())
+            a1 = n02_1 / n1
+            a2 = n02_2 / n2
+            F12 = 2 * a1 * a2 / (a1 + a2 + H_TAU)
+
+            n12_1 = int(((m1 & m2) & pos).sum().item())
+            n12_2 = int(((m2 & m1) & neg).sum().item())
+            b1 = n12_1 / n1
+            b2 = n12_2 / n2
+            G12 = 2 * b1 * b2 / (b1 + b2 + H_TAU)
+
+            for cG in cG_grid:
+                S = F12 - float(cG) * G12
+                if S > best_S:
+                    best_S = S
+                    best_bp = bpos
+                    best_bn = bneg
+                    best_cG = float(cG)
+
+    return best_bp, best_bn, best_cG, best_S
+
+def evaluate_reduction(
+    X: np.ndarray,
+    y: np.ndarray,
+    reducer_name: str,
+    reducer_ctor: Any,
+    q: int,
+    dataset_name: str,
+    n_splits: int = 5,
+    reducer_kwargs: Dict[str, Any] = None,
+    compute_unary_on_reduced: bool = True,
+    unary_params: Dict[str, Any] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+
+    reducer_kwargs = reducer_kwargs or {}
+    unary_params = unary_params or dict(
+        d_hidden=48,
+        n_hidden_layers=2,
+        num_epochs=60,
+        batch_size=256,
+        beta_grid=31,
+        cG_grid=(0.10, 0.20, 0.25, 0.33, 0.50, 0.67, 0.75, 1.00, 1.25),
+
+    )
+
+    y_orig = np.asarray(y).ravel()
+    if set(np.unique(y_orig)) == {-1, 1}:
+        y_bin = (y_orig == 1).astype(int)
+    else:
+        y_bin = y_orig.astype(int)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    rows_cls: List[Dict[str, Any]] = []
+    rows_unary: List[Dict[str, Any]] = []
+
+    for fold, (tr, te) in enumerate(skf.split(X, y_bin), 1):
+        Xtr, Xte = X[tr], X[te]
+        ytr_bin, yte_bin = y_bin[tr], y_bin[te]
+        ytr_orig, yte_orig = y_orig[tr], y_orig[te]
+
+
+        scaler = StandardScaler()
+        Xtr_s = scaler.fit_transform(Xtr)
+        Xte_s = scaler.transform(Xte)
+
+
+        base_scores = {}
+        models = get_models()
+        for mname, base_model in models.items():
+            m0 = base_model.__class__(**base_model.get_params())
+            t0 = perf_counter()
+            m0.fit(Xtr_s, ytr_bin)
+            t0 = perf_counter() - t0
+            p0 = m0.predict_proba(Xte_s)[:, 1] if hasattr(m0, "predict_proba") else m0.decision_function(Xte_s)
+            auc0 = roc_auc_score(yte_bin, p0)
+            ap0 = average_precision_score(yte_bin, p0)
+            base_scores[mname] = (auc0, ap0, t0)
+
+
+        red = reducer_ctor(q=q, **reducer_kwargs)
+        tR = perf_counter()
+        Ztr = red.fit_transform(Xtr_s, ytr_orig)
+        Zte = red.transform(Xte_s)
+        tR = perf_counter() - tR
+
+
+        for mname, base_model in models.items():
+            auc0, ap0, t0 = base_scores[mname]
+            m1 = base_model.__class__(**base_model.get_params())
+            t1 = perf_counter()
+            m1.fit(Ztr, ytr_bin)
+            t1 = perf_counter() - t1
+            p1 = m1.predict_proba(Zte)[:, 1] if hasattr(m1, "predict_proba") else m1.decision_function(Zte)
+            auc1 = roc_auc_score(yte_bin, p1)
+            ap1 = average_precision_score(yte_bin, p1)
+
+            rows_cls.append({
+                "dataset": dataset_name, "method": reducer_name, "q": q, "model": mname, "fold": fold,
+                "AUC": auc1, "PR_AUC": ap1, "ΔAUC": auc1 - auc0, "ΔPR_AUC": ap1 - ap0,
+                "t_reducer": tR, "t_model": t1, "t_model_base": t0
+            })
+
+
+        if compute_unary_on_reduced:
+            dev_param = unary_params.get("device", None)
+            if dev_param is not None:
+                unary_device_preferred = torch.device(dev_param)
+            else:
+                if torch.cuda.is_available():
+                    unary_device_preferred = torch.device("cuda")
+                elif torch.backends.mps.is_available():
+                    unary_device_preferred = torch.device("mps")
+                else:
+                    unary_device_preferred = torch.device("cpu")
+
+            ytr_pm = np.where(ytr_orig == 1, 1, -1)
+            yte_pm = np.where(yte_orig == 1, 1, -1)
+
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+            (fit_idx, val_idx), = sss.split(Ztr, (ytr_pm == 1).astype(int))
+            Ztr_fit, Ztr_val = Ztr[fit_idx], Ztr[val_idx]
+            y_fit_pm, y_val_pm = ytr_pm[fit_idx], ytr_pm[val_idx]
+
+
+            X_fit_t = torch.as_tensor(Ztr_fit, dtype=torch.float32, device=unary_device_preferred)
+            y_fit_t = torch.as_tensor(y_fit_pm, dtype=torch.int64, device=unary_device_preferred)
+            train_ds_fit = TensorDataset(X_fit_t, y_fit_t)
+
+            model_pos, model_neg = model_train(
+                d_hidden=unary_params.get("d_hidden", 32),
+                n_hidden_layers=unary_params.get("n_hidden_layers", 1),
+                train_data=train_ds_fit,
+                num_epochs=unary_params.get("num_epochs", 50),
+                batch_size=unary_params.get("batch_size", 256),
+                seed=unary_params.get("seed", 0),
+                output=False,
+            )
+            model_pos.eval()
+            model_neg.eval()
+
+            unary_device = next(model_pos.parameters()).device 
+
+            X_val_t = torch.as_tensor(Ztr_val, dtype=torch.float32, device=unary_device)
+            y_val_t = torch.as_tensor(y_val_pm, dtype=torch.int64, device=unary_device)
+
+            fmin, fmax = compute_feature_bounds(TensorDataset(X_fit_t, y_fit_t))
+            fmin = fmin.to(unary_device)
+            fmax = fmax.to(unary_device)
+
+            beta_pos, beta_neg, cG_star, S_val = tune_betas_joint(
+                model_pos, model_neg,
+                X_val_t, y_val_t,
+                fmin, fmax,
+                n_grid=unary_params.get("beta_grid", 19),
+                cG_grid=unary_params.get("cG_grid", (0.25, 0.5, 0.75, 1.0))
+            )
+
+
+            X_te_t = torch.as_tensor(Zte, dtype=torch.float32, device=unary_device)
+            yte_pm_t = torch.as_tensor(yte_pm, dtype=torch.int64, device=unary_device)
+
+            m_un = metrics_from_sheet(
+                X_te_t, yte_pm_t,
+                model_pos, model_neg,
+                beta_pos=float(beta_pos), beta_neg=float(beta_neg)
+            )
+
+
+            with torch.no_grad():
+                s1_te = model_pos(X_te_t).flatten()
+                s2_te = model_neg(X_te_t).flatten()
+
+            pos_hit = (s1_te >= float(beta_pos)) & (s2_te <  float(beta_neg))
+            neg_hit = (s2_te >= float(beta_neg)) & (s1_te <  float(beta_pos))
+            coverage = float((pos_hit | neg_hit).float().mean().item())
+
+            S_test = float(m_un["F12"] - cG_star * m_un["G12"])
+
+            rows_unary.append({
+                "dataset": dataset_name, "method": reducer_name, "q": q, "model": "UnaryMLP", "fold": fold,
+                "F12": float(m_un["F12"]), "G12": float(m_un["G12"]),
+                "a1": float(m_un["a1"]), "a2": float(m_un["a2"]),
+                "b1": float(m_un["b1"]), "b2": float(m_un["b2"]),
+                "n1": int(m_un["n1"]), "n2": int(m_un["n2"]),
+                "coverage": coverage,
+                "beta_pos": float(beta_pos), "beta_neg": float(beta_neg),
+                "cG": float(cG_star), "S_val": float(S_val), "S_test": S_test,
+                "t_reducer": tR, "t_model": 0.0,
+                "unary_device": str(unary_device),
+            })
+
+    return rows_cls, rows_unary
+
+
+def dynamic_bounds(
+    n: int,
+    q: int,
+    A_idx: np.ndarray,
+    step: int,
+    n_steps: int,
+    # upper caps
+    uA_mult_start: float = 1.10,   # U_A raw = uA_mult / q
+    uA_mult_end: float = 1.25,
+    u0_mult_start: float = 0.90,   # U_0 = u0_mult / q
+    u0_mult_end: float = 1.05,
+    # lower masses
+    mass_A_start: float = 0.10,
+    mass_A_end: float = 0.22,
+    mass_0_start: float = 0.12,
+    mass_0_end: float = 0.08,
+    # explicit outside reserve
+    outside_reserve_start: float = 0.30,
+    outside_reserve_end: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Возвращает покоординатные lower/upper bounds для проекции:
+      - для j in Ahat:     lb_j = L_A, ub_j = U_A
+      - для j not in Ahat: lb_j = L_0, ub_j = U_0
+
+    Дополнительно enforce-ится минимальная внешняя масса:
+        sum_{j not in Ahat} pi_j >= reserve_out,
+    что эквивалентно
+        sum_{j in Ahat} pi_j <= 1 - reserve_out.
+    """
+    assert n >= 1
+    assert 1 <= q <= n
+
+    A = np.unique(np.asarray(A_idx, dtype=int).reshape(-1))
+    A = A[(A >= 0) & (A < n)]
+    m = int(A.size)
+    n_out = n - m
+
+    progress = 0.0 if n_steps <= 1 else step / (n_steps - 1)
+
+    # ---------- explicit outside reserve ----------
+    reserve_out = outside_reserve_start + (outside_reserve_end - outside_reserve_start) * progress
+    reserve_out = float(np.clip(reserve_out, 0.0, 0.95))
+
+    # ---------- raw upper caps ----------
+    U_A_raw = (uA_mult_start + (uA_mult_end - uA_mult_start) * progress) / max(q, 1)
+    U_0 = (u0_mult_start + (u0_mult_end - u0_mult_start) * progress) / max(q, 1)
+
+    U_A_raw = float(np.clip(U_A_raw, 1.0 / n + 1e-9, 1.0))
+    U_0 = float(np.clip(U_0, 1.0 / n + 1e-9, 1.0))
+
+    # Чтобы outside reserve был достижим, вне Ahat должна быть достаточная capacity
+    if n_out > 0:
+        U_0 = max(U_0, reserve_out / n_out + 1e-9)
+        U_0 = float(np.clip(U_0, 1.0 / n + 1e-9, 1.0))
+
+    # Cap на anchors, чтобы внутри Ahat не утаскивалась вся масса
+    if m > 0:
+        U_A_reserve = (1.0 - reserve_out) / m
+        U_A = min(U_A_raw, U_A_reserve)
+        U_A = float(np.clip(U_A, 1.0 / n + 1e-9, 1.0))
+    else:
+        U_A = U_A_raw
+
+    # ---------- lower masses ----------
+    mass_A = 0.0 if m == 0 else mass_A_start + (mass_A_end - mass_A_start) * progress
+    mass_A = float(np.clip(mass_A, 0.0, 0.75))
+
+    mass_0 = mass_0_start + (mass_0_end - mass_0_start) * progress
+    mass_0 = float(np.clip(mass_0, 0.0, 0.50))
+
+    L_A = (mass_A / m) if m > 0 else 0.0
+    L_0 = (mass_0 / n_out) if n_out > 0 else 0.0
+
+    # lower bounds должны быть существенно ниже соответствующих upper bounds
+    if m > 0:
+        L_A = min(L_A, 0.85 * U_A)
+    if n_out > 0:
+        L_0 = min(L_0, 0.50 * U_0)
+
+    # Anchor-floor не должен сам по себе убивать outside reserve
+    if m > 0:
+        max_anchor_mass = max(0.0, 1.0 - reserve_out - 1e-6)
+        if m * L_A > max_anchor_mass:
+            L_A = max_anchor_mass / m
+
+    # Общая feasibility по lower bounds
+    total_lb = m * L_A + n_out * L_0
+    if total_lb >= 1.0 - 1e-8:
+        scale = (1.0 - 1e-6) / total_lb
+        L_A *= scale
+        L_0 *= scale
+
+    lb = np.full(n, L_0, dtype=float)
+    ub = np.full(n, U_0, dtype=float)
+
+    if m > 0:
+        lb[A] = L_A
+        ub[A] = U_A
+
+    # safety: coordinatewise feasibility
+    bad = lb > ub
+    if np.any(bad):
+        lb[bad] = np.minimum(lb[bad], ub[bad] - 1e-9)
+        lb = np.maximum(lb, 0.0)
+
+    info = {
+        "U_A": float(U_A),
+        "U0": float(U_0),
+        "L_A": float(L_A),
+        "L0": float(L_0),
+        "anchor_size": int(m),
+        "mass_A_lb": float(m * L_A),
+        "mass_0_lb": float(n_out * L_0),
+        "reserve_out": float(reserve_out),
+        "anchor_cap_total": float(m * U_A) if m > 0 else 0.0,
+    }
+    return lb, ub, info
+
+H_TAU = 1e-3
+def _h_tau(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    return 2.0 * x * y / (x + y + H_TAU)
+
+def _expand_anchor_set(
+    scores: np.ndarray,
+    A_prev: np.ndarray,
+    q: int,
+    step: int,
+    n_steps: int,
+    min_mult_uniform = 1.1,
+    add_frac_start = 0.15,
+    add_frac_end   = 0.25,
+    cap_mult_start = 1.6,
+    cap_mult_end   = 1.3
+) -> np.ndarray:
+    """
+    Накопительно расширяет anchor-set Ahat из текущего step-specific score-вектора.
+    Важно: сюда следует подавать score текущего шага (например coord_new_prob),
+    а не уже сглаженный/projection-aware вектор.
+
+    Добавляет top новых координат, но ограничивает общий размер Ahat.
+    """
+    s = np.asarray(scores, dtype=float).reshape(-1)
+    n = s.size
+
+    s[~np.isfinite(s)] = 0.0
+    s = np.maximum(s, 0.0)
+
+    A_prev = np.unique(np.asarray(A_prev, dtype=int).reshape(-1))
+    A_prev = A_prev[(A_prev >= 0) & (A_prev < n)]
+
+    if s.sum() <= 0:
+        return A_prev.copy()
+
+    s = s / s.sum()
+
+    progress = 0.0 if n_steps <= 1 else step / (n_steps - 1)
+
+    add_frac = add_frac_start + (add_frac_end - add_frac_start) * progress
+    cap_mult = cap_mult_start + (cap_mult_end - cap_mult_start) * progress
+
+    add_count = max(1, int(np.ceil(q * add_frac)))
+    cap_size = min(n, max(q, int(np.ceil(q * cap_mult))))
+
+    baseline = min_mult_uniform / max(n, 1)
+
+    current = set(A_prev.tolist())
+    ranked = np.argsort(-s)
+
+    # если Ahat ещё пусто — инициализируем top-координатами текущего шага
+    if len(current) == 0:
+        init_take = min(add_count, cap_size, n)
+        return np.sort(ranked[:init_take]).astype(int)
+
+    added = 0
+    for idx in ranked:
+        idx = int(idx)
+        if idx in current:
+            continue
+        if len(current) >= cap_size:
+            break
+        if s[idx] < baseline:
+            break
+        current.add(idx)
+        added += 1
+        if added >= add_count:
+            break
+
+    return np.array(sorted(current), dtype=int)
+
+def _project_box_simplex(
+    v: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    tol: float = 1e-10,
+    max_iter: int = 200,
+) -> np.ndarray:
+    """
+    Евклидова проекция на множество
+        {x : sum_i x_i = 1, lb_i <= x_i <= ub_i}.
+    """
+    v = np.asarray(v, dtype=float).reshape(-1)
+    lb = np.asarray(lb, dtype=float).reshape(-1)
+    ub = np.asarray(ub, dtype=float).reshape(-1)
+
+    if not (v.shape == lb.shape == ub.shape):
+        raise ValueError("v, lb, ub must have the same shape")
+    if np.any(lb > ub):
+        raise ValueError("Found lb_i > ub_i")
+    if lb.sum() > 1.0 + 1e-12:
+        raise ValueError("Infeasible lower bounds: sum(lb) > 1")
+    if ub.sum() < 1.0 - 1e-12:
+        raise ValueError("Infeasible upper bounds: sum(ub) < 1")
+
+    if abs(lb.sum() - 1.0) <= tol:
+        x = lb.copy()
+        return x / x.sum()
+    if abs(ub.sum() - 1.0) <= tol:
+        x = ub.copy()
+        return x / x.sum()
+
+    lo = np.min(v - ub)
+    hi = np.max(v - lb)
+
+    for _ in range(max_iter):
+        tau = 0.5 * (lo + hi)
+        x = np.clip(v - tau, lb, ub)
+        s = x.sum()
+
+        if s > 1.0:
+            lo = tau
+        else:
+            hi = tau
+
+        if hi - lo <= tol:
+            break
+
+    tau = 0.5 * (lo + hi)
+    x = np.clip(v - tau, lb, ub)
+
+    s = x.sum()
+    if s <= 0 or not np.isfinite(s):
+        raise ValueError("Projection failed: non-positive or non-finite sum")
+
+    x /= s
+    return x
+
+def _chunk_list(seq, chunk_size: int):
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    for start in range(0, len(seq), chunk_size):
+        yield seq[start:start + chunk_size]
+
+class EnsembleReducer(ReducerBase):
+    def __init__(
+        self,
+        d_hidden,
+        n_hidden_layers,
+        num_epochs,
+        batch_size,
+        n_select,
+        num_models,
+        num_attempts,
+        num_coords,
+        num_samples,
+        seed=0,
+        output=False,
+        device: str = "cpu",
+        use_gpu_shap: bool = False,
+        max_models_per_batch: int = 32,
+        max_shap_models_per_batch: int = 16,
+    ):
+        self.d_hidden = d_hidden
+        self.n_hidden_layers = n_hidden_layers
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.seed = seed
+        self.output = output
+        self.n_select = n_select
+        self.num_samples = num_samples
+        self.num_models = num_models
+        self.num_attempts = num_attempts
+        self.num_coords = num_coords  # maximal subspace size D
+        self.max_models_per_batch = int(max_models_per_batch)
+        self.max_shap_models_per_batch = int(max_shap_models_per_batch)
+
+        self.list_model_pos = []
+        self.list_model_neg = []
+        self.list_model_subs = []
+        self.list_beta_pos = []
+        self.list_beta_neg = []
+        self.list_best_cG = []
+        self.list_best_S = []
+        self.coord_prob = None
+        self.history_ = []
+        self.rng = np.random.default_rng(self.seed)
+        self.eta_history_ = []
+        self.eta_last_ = None
+        self.eta_final_ = None
+
+        self.selected_indices_ = None
+
+        self.device = torch.device(device)
+        self.use_gpu_shap = use_gpu_shap
+
+    def _to_torch2d(self, X):
+        if isinstance(X, torch.Tensor):
+            assert X.ndim == 2, "X must be 2D"
+            return X.to(dtype=torch.float32)
+        X = np.asarray(X)
+        assert X.ndim == 2, "X must be 2D"
+        return torch.from_numpy(X).to(dtype=torch.float32)
+
+    def _to_torch1d_int(self, y):
+        if isinstance(y, torch.Tensor):
+            assert y.ndim == 1, "y must be 1D"
+            return y.to(dtype=torch.int64)
+        y = np.asarray(y).ravel()
+        return torch.from_numpy(y.astype(np.int64))
+
+    @staticmethod
+    def _shap_mean_pos(expl, X):
+        vals = expl.shap_values(X)
+        if isinstance(vals, list):
+            vals = np.array(vals)
+            if vals.ndim == 3:
+                vals = vals.mean(axis=0)
+        V = np.atleast_2d(np.asarray(vals, float))
+        return np.maximum(V, 0.0).mean(axis=0)
+
+    @staticmethod
+    def _robust_norm(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=float)
+        v = np.maximum(v, 0.0)
+        if not np.any(np.isfinite(v)):
+            return np.full_like(v, 1.0 / max(1, v.size))
+        p95 = np.percentile(v[np.isfinite(v)], 95.0)
+        if p95 > 0:
+            v = np.minimum(v, p95)
+        s = v.sum()
+        return (v / s) if (np.isfinite(s) and s > 0) else np.full_like(v, 1.0 / max(1, v.size))
+
+    @staticmethod
+    def _theory_shap_importance(mu_pos: np.ndarray, mu_neg: np.ndarray, subspace_size: int) -> np.ndarray:
+        """
+        Практический SHAP-объект, близкий к теории:
+        1) positive SHAP для двух моделей,
+        2) robust normalization,
+        3) регуляризованное гармоническое среднее H_tau,
+        4) нормировка внутри подпространства,
+        5) clipped object U(j)=min(1, |S| * phi(j)).
+        """
+        mu_pos = np.squeeze(np.asarray(mu_pos, dtype=float)).reshape(-1)
+        mu_neg = np.squeeze(np.asarray(mu_neg, dtype=float)).reshape(-1)
+
+        mu_pos = np.maximum(mu_pos, 0.0)
+        mu_neg = np.maximum(mu_neg, 0.0)
+
+        mu_pos = EnsembleReducer._robust_norm(mu_pos)
+        mu_neg = EnsembleReducer._robust_norm(mu_neg)
+
+        phi_sub = _h_tau(mu_pos, mu_neg)
+
+        s = phi_sub.sum()
+        if not np.isfinite(s) or s <= 0:
+            phi_sub = np.full_like(phi_sub, 1.0 / max(1, phi_sub.size))
+        else:
+            phi_sub = phi_sub / s
+
+        U_sub = np.minimum(1.0, float(subspace_size) * phi_sub)
+        return U_sub
+
+    @staticmethod
+    def _project_capped_simplex(p: np.ndarray, L: float, U: float) -> np.ndarray:
+        p = np.asarray(p, dtype=float)
+        n = p.size
+        L = float(L)
+        U = float(U)
+        L = min(L, 1.0 / n)
+        U = max(U, 1.0 / n)
+
+        x = np.clip(p, L, U)
+        r = 1.0 - x.sum()
+        if abs(r) < 1e-12:
+            return x / x.sum()
+
+        for _ in range(5):
+            if r > 0:
+                mask = (x < U - 1e-12)
+                if not np.any(mask):
+                    break
+                w = p[mask].copy()
+                w[w < 0] = 0.0
+                if not np.any(w):
+                    w = np.ones_like(w)
+                w = w / w.sum()
+                delta = np.minimum(U - x[mask], r * w / (w.sum() + 1e-12))
+                add = delta * (r / (delta.sum() + 1e-12))
+                x[mask] += add
+                r = 1.0 - x.sum()
+            else:
+                mask = (x > L + 1e-12)
+                if not np.any(mask):
+                    break
+                w = p[mask].copy()
+                w[w < 0] = 0.0
+                if not np.any(w):
+                    w = np.ones_like(w)
+                w = w / w.sum()
+                delta = np.minimum(x[mask] - L, (-r) * w / (w.sum() + 1e-12))
+                sub = delta * ((-r) / (delta.sum() + 1e-12))
+                x[mask] -= sub
+                r = 1.0 - x.sum()
+
+            if abs(r) < 1e-12:
+                break
+
+        x = np.clip(x, L, U)
+        x /= x.sum()
+        return x
+
+    def _sample_subspace_size(self, D: int, rho: float = 0.25) -> int:
+        """
+        Выбирает размер подпространства d in {1, ..., D}
+        из смеси:
+        rho * Uniform({1,...,D}) + (1-rho) * IncreasingLinear.
+        """
+        D = int(max(1, D))
+        d_grid = np.arange(1, D + 1, dtype=int)
+
+        p_unif = np.full(D, 1.0 / D, dtype=float)
+        p_inc = 2.0 * d_grid.astype(float) / (D * (D + 1))
+
+        p = rho * p_unif + (1.0 - rho) * p_inc
+        p /= p.sum()
+
+        return int(self.rng.choice(d_grid, p=p))
+    
+    def _draw_candidate_subspaces(self, n_feat: int) -> list[np.ndarray]:
+        """
+        Сэмплирует сразу все подпространства для одного outer-slot,
+        после чего их можно сгруппировать по размерности и обучать пакетно.
+        """
+        D_max = min(self.num_coords, n_feat)
+        lam = 0.3
+
+        out: list[np.ndarray] = []
+        for _ in range(self.num_attempts):
+            d_cur = self._sample_subspace_size(D_max, rho=0.25)
+
+            if self.rng.random() < lam:
+                subs_idx = self.rng.choice(n_feat, size=d_cur, replace=False)
+            else:
+                subs_idx = self.rng.choice(
+                    n_feat, size=d_cur, replace=False, p=self.coord_prob
+                )
+
+            out.append(np.sort(subs_idx).astype(int))
+
+        return out
+    
+    def _compute_step_shap_batched(
+        self,
+        model_indices: list[int],
+        X_tr: torch.Tensor,
+        X_par: torch.Tensor,
+        y_par: torch.Tensor,
+        bg_idx: torch.Tensor,
+        ev_idx: torch.Tensor,
+        n_feat: int,
+    ) -> tuple[np.ndarray, int]:
+        """
+        Считает SHAP для одного outer-step пакетно:
+        - группировка по размерности подпространства,
+        - chunking по числу моделей,
+        - внутри чанка один GradientExplainer для positive и один для negative.
+        """
+        coord_shap_sum = np.zeros(n_feat, dtype=float)
+        n_shap_blocks = 0
+
+        # Сначала соберём индексы моделей по размерности подпространства
+        groups: dict[int, list[int]] = defaultdict(list)
+        for idx in model_indices:
+            subs = self.list_model_subs[idx]
+            groups[len(subs)].append(idx)
+
+        if self.use_gpu_shap and self.device.type == "cuda":
+            shap_device = self.device
+            X_tr_src = X_tr
+            X_par_src = X_par
+            y_par_src = y_par
+        else:
+            shap_device = torch.device("cpu")
+            X_tr_src = X_tr.detach().cpu()
+            X_par_src = X_par.detach().cpu()
+            y_par_src = y_par.detach().cpu()
+
+        X_bg_base = X_tr_src[bg_idx]
+        X_eval_base = X_par_src[ev_idx]
+        y_eval_base = y_par_src[ev_idx]
+
+        for d_cur, idx_list in groups.items():
+            for idx_chunk in _chunk_list(idx_list, self.max_shap_models_per_batch):
+                subs_chunk = [self.list_model_subs[idx] for idx in idx_chunk]
+
+                X_bg_pack = _pack_inputs_for_shap(X_bg_base, subs_chunk).to(shap_device)
+                X_eval_pack = _pack_inputs_for_shap(X_eval_base, subs_chunk).to(shap_device)
+
+                pos_mask = (y_eval_base == 1)
+                neg_mask = (y_eval_base == -1)
+
+                X_pos_pack = X_eval_pack[pos_mask]
+                X_neg_pack = X_eval_pack[neg_mask]
+
+                if X_pos_pack.shape[0] == 0:
+                    X_pos_pack = X_eval_pack
+                if X_neg_pack.shape[0] == 0:
+                    X_neg_pack = X_eval_pack
+
+                models_pos = [
+                    copy.deepcopy(self.list_model_pos[idx]).to(shap_device).eval()
+                    for idx in idx_chunk
+                ]
+                models_neg = [
+                    copy.deepcopy(self.list_model_neg[idx]).to(shap_device).eval()
+                    for idx in idx_chunk
+                ]
+
+                mu_pos_batch = _batched_gradient_shap_for_group(
+                    models=models_pos,
+                    X_bg_pack=X_bg_pack,
+                    X_eval_pack=X_pos_pack,
+                    device=shap_device,
+                )  # [B, d]
+
+                mu_neg_batch = _batched_gradient_shap_for_group(
+                    models=models_neg,
+                    X_bg_pack=X_bg_pack,
+                    X_eval_pack=X_neg_pack,
+                    device=shap_device,
+                )  # [B, d]
+
+                for loc, idx_model in enumerate(idx_chunk):
+                    subs = self.list_model_subs[idx_model]
+
+                    mu_pos = np.asarray(mu_pos_batch[loc], dtype=float).reshape(-1)
+                    mu_neg = np.asarray(mu_neg_batch[loc], dtype=float).reshape(-1)
+
+                    if mu_pos.shape != mu_neg.shape:
+                        raise ValueError(f"Shape mismatch in batched SHAP: {mu_pos.shape} vs {mu_neg.shape}")
+
+                    U_sub = self._theory_shap_importance(
+                        mu_pos=mu_pos,
+                        mu_neg=mu_neg,
+                        subspace_size=len(subs),
+                    )
+
+                    coord_shap_sum[subs] += U_sub
+                    n_shap_blocks += 1
+
+        return coord_shap_sum, n_shap_blocks
+
+    def fit(self, X, y):
+        X_t = self._to_torch2d(X).to(self.device)
+        y_t = self._to_torch1d_int(y).to(self.device)
+
+        n_feat = X_t.shape[1]
+        n_samples_total = X_t.shape[0]
+
+        # reset на случай повторного fit
+        self.list_model_pos = []
+        self.list_model_neg = []
+        self.list_model_subs = []
+        self.list_beta_pos = []
+        self.list_beta_neg = []
+        self.list_best_cG = []
+        self.list_best_S = []
+        self.anchor_set_ = np.array([], dtype=int)
+        self.eta_history_ = []
+        self.eta_last_ = None
+        self.eta_final_ = None
+        self.selected_indices_ = None
+
+        y_np = y_t.detach().cpu().numpy().ravel()
+        idx_np = np.arange(n_samples_total)
+
+        # ---------- 60 / 20 / 20 ----------
+        tr_idx_np, tmp_idx_np = train_test_split(
+            idx_np,
+            test_size=0.4,
+            random_state=self.seed,
+            stratify=y_np
+        )
+
+        y_tmp_np = y_np[tmp_idx_np]
+
+        par_idx_np, val_idx_np = train_test_split(
+            tmp_idx_np,
+            test_size=0.5,
+            random_state=self.seed + 1,
+            stratify=y_tmp_np
+        )
+
+        tr_idx = torch.as_tensor(tr_idx_np, dtype=torch.long, device=X_t.device)
+        par_idx = torch.as_tensor(par_idx_np, dtype=torch.long, device=X_t.device)
+        val_idx = torch.as_tensor(val_idx_np, dtype=torch.long, device=X_t.device)
+
+        X_tr, y_tr = X_t[tr_idx], y_t[tr_idx]      # Dtr
+        X_par, y_par = X_t[par_idx], y_t[par_idx] # Dpar
+        X_val, y_val = X_t[val_idx], y_t[val_idx] # Dval
+
+        n_bg = min(128, X_tr.shape[0])
+        n_ev = min(256, X_par.shape[0])
+
+        bg_idx_np = self.rng.choice(X_tr.shape[0], size=n_bg, replace=False)
+        bg_idx = torch.as_tensor(bg_idx_np, dtype=torch.long, device=X_tr.device)
+
+        y_par_np = y_par.detach().cpu().numpy().ravel()
+        pos_idx = np.where(y_par_np == 1)[0]
+        neg_idx = np.where(y_par_np == -1)[0]
+
+        n_ev_pos = min(len(pos_idx), max(1, n_ev // 2))
+        n_ev_neg = min(len(neg_idx), max(1, n_ev - n_ev_pos))
+
+        ev_pos = self.rng.choice(pos_idx, size=n_ev_pos, replace=False) if len(pos_idx) > 0 else np.array([], dtype=int)
+        ev_neg = self.rng.choice(neg_idx, size=n_ev_neg, replace=False) if len(neg_idx) > 0 else np.array([], dtype=int)
+
+        ev_idx_np = np.concatenate([ev_pos, ev_neg])
+        if ev_idx_np.size == 0:
+            ev_idx_np = self.rng.choice(X_par.shape[0], size=min(n_ev, X_par.shape[0]), replace=False)
+
+        self.rng.shuffle(ev_idx_np)
+        ev_idx = torch.as_tensor(ev_idx_np, dtype=torch.long, device=X_par.device)
+
+        fmin_all, fmax_all = compute_feature_bounds(TensorDataset(X_tr, y_tr))
+        fmin_all = fmin_all.to(device=X_tr.device, dtype=X_tr.dtype)
+        fmax_all = fmax_all.to(device=X_tr.device, dtype=X_tr.dtype)
+
+        self.coord_prob = np.full(n_feat, 1.0 / n_feat, dtype=float)
+
+        for k in range(self.num_samples):
+            for i in range(self.num_models):
+                best_model_pos = best_model_neg = None
+                best_subs_idx = None
+                best_beta_pos = best_beta_neg = None
+                best_best_S = -float("inf")
+                best_best_cG = None
+
+                # 1) Сразу генерируем все candidate subspaces для этого outer-slot
+                candidates = self._draw_candidate_subspaces(n_feat)
+
+                # 2) Группируем по размерности d, чтобы батчить модели с одинаковым d_in
+                groups: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+                for cand_id, subs_idx in enumerate(candidates):
+                    groups[len(subs_idx)].append((cand_id, subs_idx))
+
+                pos_tr_mask = (y_tr == 1)
+                neg_tr_mask = (y_tr == -1)
+                print("yep")
+                for d_cur, items in groups.items():
+                    for chunk_id, items_chunk in enumerate(_chunk_list(items, self.max_models_per_batch)):
+                        subs_batch_np = np.stack([subs for _, subs in items_chunk], axis=0)  # [Bgrp, d]
+                        subs_batch_t = torch.as_tensor(
+                            subs_batch_np, dtype=torch.long, device=X_tr.device
+                        )
+
+                        X_sub_tr_batch = _gather_subspaces_2d(X_tr, subs_batch_t)
+                        X_sub_par_batch = _gather_subspaces_2d(X_par, subs_batch_t)
+                        X_sub_val_batch = _gather_subspaces_2d(X_val, subs_batch_t)
+
+                        fmin_batch = fmin_all[subs_batch_t]
+                        fmax_batch = fmax_all[subs_batch_t]
+
+                        X_pos_tr_batch = X_sub_tr_batch[:, pos_tr_mask, :]
+                        X_neg_tr_batch = X_sub_tr_batch[:, neg_tr_mask, :]
+
+                        if X_pos_tr_batch.shape[1] == 0 or X_neg_tr_batch.shape[1] == 0:
+                            raise ValueError("Empty class encountered during batched candidate training")
+
+                        seed_base = self.seed + 100000 * k + 1000 * i + 50 * d_cur + chunk_id
+
+                        model_pos_batch = _batched_train_one_side(
+                            X_real_batch=X_pos_tr_batch,
+                            feature_min_batch=fmin_batch,
+                            feature_max_batch=fmax_batch,
+                            d_hidden=self.d_hidden,
+                            n_hidden_layers=self.n_hidden_layers,
+                            num_epochs=self.num_epochs,
+                            batch_size=self.batch_size,
+                            seed=seed_base,
+                        )
+
+                        model_neg_batch = _batched_train_one_side(
+                            X_real_batch=X_neg_tr_batch,
+                            feature_min_batch=fmin_batch,
+                            feature_max_batch=fmax_batch,
+                            d_hidden=self.d_hidden,
+                            n_hidden_layers=self.n_hidden_layers,
+                            num_epochs=self.num_epochs,
+                            batch_size=self.batch_size,
+                            seed=seed_base + 1,
+                        )
+
+                        beta_pos_batch, beta_neg_batch, cG_batch, _ = _batched_tune_betas_joint(
+                            model_pos=model_pos_batch,
+                            model_neg=model_neg_batch,
+                            X_val_batch=X_sub_par_batch,
+                            y_val=y_par,
+                            fmin_batch=fmin_batch,
+                            fmax_batch=fmax_batch,
+                            n_grid=19,
+                            cG_grid=(0.25, 0.5, 0.75, 1.0),
+                        )
+
+                        model_pos_batch.eval()
+                        model_neg_batch.eval()
+
+                        with torch.no_grad():
+                            s1_val_batch = model_pos_batch(X_sub_val_batch).squeeze(-1)
+                            s2_val_batch = model_neg_batch(X_sub_val_batch).squeeze(-1)
+
+                        m_val_batch = _batched_metrics_from_scores(
+                            s1=s1_val_batch,
+                            s2=s2_val_batch,
+                            y=y_val,
+                            beta_pos=beta_pos_batch,
+                            beta_neg=beta_neg_batch,
+                        )
+
+                        S_val_batch = m_val_batch["F12"] - cG_batch * m_val_batch["G12"]
+
+                        loc = int(torch.argmax(S_val_batch).item())
+                        S_cur = float(S_val_batch[loc].item())
+
+                        if S_cur > best_best_S:
+                            best_best_S = S_cur
+                            best_subs_idx = subs_batch_np[loc].copy()
+                            best_beta_pos = float(beta_pos_batch[loc].item())
+                            best_beta_neg = float(beta_neg_batch[loc].item())
+                            best_best_cG = float(cG_batch[loc].item())
+
+                            best_model_pos = model_pos_batch.extract_model(loc).to(self.device)
+                            best_model_neg = model_neg_batch.extract_model(loc).to(self.device)
+                            best_model_pos.eval()
+                            best_model_neg.eval()
+
+                self.list_model_pos.append(best_model_pos)
+                self.list_model_neg.append(best_model_neg)
+                self.list_model_subs.append(best_subs_idx)
+                self.list_beta_pos.append(best_beta_pos)
+                self.list_beta_neg.append(best_beta_neg)
+                self.list_best_cG.append(best_best_cG)
+                self.list_best_S.append(best_best_S)
+
+            start = len(self.list_model_pos) - self.num_models
+            end = len(self.list_model_pos)
+
+            all_global_idx = list(range(start, end))
+
+            coord_shap_sum, n_shap_blocks = self._compute_step_shap_batched(
+                model_indices=all_global_idx,
+                X_tr=X_tr,
+                X_par=X_par,
+                y_par=y_par,
+                bg_idx=bg_idx,
+                ev_idx=ev_idx,
+                n_feat=n_feat,
+            )
+
+            # Step-specific SHAP score в полном пространстве
+            if n_shap_blocks > 0:
+                coord_new_prob = coord_shap_sum / float(n_shap_blocks)
+            else:
+                coord_new_prob = np.full(n_feat, 1.0 / n_feat, dtype=float)
+
+            eta_step = np.asarray(coord_new_prob, dtype=float).copy()
+            s = eta_step.sum()
+            if not np.isfinite(s) or s <= 0:
+                eta_step[:] = 1.0 / n_feat
+            else:
+                eta_step /= s
+
+            self.eta_last_ = eta_step
+            self.eta_history_.append(eta_step.copy())
+
+            progress = 0.0 if self.num_samples <= 1 else k / (self.num_samples - 1)
+
+            # Смешивание оставляем, но новый шаг делаем сильнее
+            gamma = 0.80 + (0.60 - 0.80) * progress
+            coord_raw = (1.0 - gamma) * self.coord_prob + gamma * eta_step
+
+            raw_sum = coord_raw.sum()
+            if not np.isfinite(raw_sum) or raw_sum <= 0:
+                coord_raw[:] = 1.0 / n_feat
+            else:
+                coord_raw /= raw_sum
+
+            # ---------- ВАЖНО ----------
+            # 1) bounds строим по старому накопленному множеству A_prev
+            A_prev = self.anchor_set_.copy()
+
+            lb, ub, caps_info = dynamic_bounds(
+                n=n_feat,
+                q=self.n_select,
+                A_idx=A_prev,
+                step=k,
+                n_steps=self.num_samples,
+            )
+
+            # 2) проекцию текущего шага делаем по A_prev
+            coord_proj = _project_box_simplex(coord_raw, lb=lb, ub=ub)
+            self.coord_prob = coord_proj
+
+            # 3) только после этого обновляем накопленное Ahat
+            #    по текущему step-specific SHAP-вектору, а не по coord_raw
+            self.anchor_set_ = _expand_anchor_set(
+                scores=eta_step,
+                A_prev=A_prev,
+                q=self.n_select,
+                step=k,
+                n_steps=self.num_samples,
+            )
+
+            print(f"Finished outer iteration {k+1}/{self.num_samples}")
+
+            if self.output:
+                print(
+                    f"iter={k+1}/{self.num_samples} "
+                    f"|A_prev|={caps_info['anchor_size']} "
+                    f"L_A={caps_info['L_A']:.6f} "
+                    f"L0={caps_info['L0']:.6f} "
+                    f"U_A={caps_info['U_A']:.6f} "
+                    f"U0={caps_info['U0']:.6f} "
+                    f"reserve_out={caps_info['reserve_out']:.3f} "
+                    f"gamma={gamma:.3f}"
+                )
+                print("A_used:", A_prev)
+                print("Ahat_next:", self.anchor_set_)
+                print("pi:", np.round(self.coord_prob, 4))
+                print("eta:", np.round(eta_step, 4))
+
+        if len(self.eta_history_) == 0:
+            self.eta_final_ = self.coord_prob.copy()
+        else:
+            tail = min(3, len(self.eta_history_))
+            self.eta_final_ = np.mean(self.eta_history_[-tail:], axis=0)
+            s = self.eta_final_.sum()
+            if not np.isfinite(s) or s <= 0:
+                self.eta_final_ = np.full_like(self.coord_prob, 1.0 / len(self.coord_prob))
+            else:
+                self.eta_final_ /= s
+
+        if self.output:
+            print("final eta:", np.round(self.eta_final_, 4))
+            print("final pi :", np.round(self.coord_prob, 4))
+            final_k = min(self.n_select, len(self.eta_final_))
+            final_idx = np.sort(np.argsort(self.eta_final_)[-final_k:])
+            print("final selected by eta:", final_idx)
+
+        return self
+
+    def coord_prob_get(self):
+        return self.coord_prob
+
+    def eta_get(self):
+        assert self.eta_final_ is not None, "Call fit() before eta_get()."
+        return self.eta_final_
+
+    def transform(self, X):
+        assert self.coord_prob is not None, "Call fit() before transform()."
+        assert self.eta_final_ is not None, "eta_final_ is missing. Call fit() first."
+        assert hasattr(self, "n_select"), "n_select must be set in __init__()."
+
+        score = np.asarray(self.eta_final_, dtype=float)
+        k = min(self.n_select, len(score))
+        topk_idx = np.argsort(score)[-k:]
+        topk_idx = np.sort(topk_idx)
+        self.selected_indices_ = topk_idx
+
+        if isinstance(X, torch.Tensor):
+            assert X.ndim == 2, "X must be 2D tensor"
+            return X[:, topk_idx]
+        else:
+            X = np.asarray(X)
+            assert X.ndim == 2, "X must be 2D array"
+            return X[:, topk_idx]
+

@@ -1,0 +1,9 @@
+{
+  "cv_seed": 42,
+  "reducer_seed": 42,
+  "clf_seed": 42,
+  "device": "cuda",
+  "n_samples": 62,
+  "n_features": 2000,
+  "n_splits": 10
+}
