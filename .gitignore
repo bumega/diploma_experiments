@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.tmp
+
+# Local datasets, experiment outputs, and generated bundles.
+data/
+results*/
+sklearn_cache_for_colon/
+dist/**/data/
+*.csv
+*.csv.gz
+*.parquet
+*.pkl
+*.npy
+*.npz
+*.zip
+
+# Notebook and editor noise.
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
